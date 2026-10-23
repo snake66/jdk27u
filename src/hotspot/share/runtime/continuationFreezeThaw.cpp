@@ -220,7 +220,6 @@ template<typename ConfigT, bool preempt> static inline freeze_result freeze_inte
 static inline int prepare_thaw_internal(JavaThread* thread, bool return_barrier);
 template<typename ConfigT> static inline intptr_t* thaw_internal(JavaThread* thread, const Continuation::thaw_kind kind);
 
-
 // Entry point to freeze. Transitions are handled manually
 // Called from gen_continuation_yield() in sharedRuntime_<cpu>.cpp through Continuation::freeze_entry();
 template<typename ConfigT>
@@ -507,13 +506,7 @@ FreezeBase::FreezeBase(JavaThread* thread, ContinuationWrapper& cont, intptr_t* 
 
   assert(!Interpreter::contains(_cont.entryPC()), "");
 
-  _bottom_address = _cont.entrySP() - _cont.entry_frame_extension();
-#ifdef _LP64
-  if (((intptr_t)_bottom_address & 0xf) != 0) {
-    _bottom_address--;
-  }
-  assert(is_aligned(_bottom_address, frame::frame_alignment), "");
-#endif
+  _bottom_address = align_down(_cont.entrySP() - _cont.entry_frame_extension(), frame::frame_alignment);
 
   log_develop_trace(continuations)("bottom_address: " INTPTR_FORMAT " entrySP: " INTPTR_FORMAT " argsize: " PTR_FORMAT,
                 p2i(_bottom_address), p2i(_cont.entrySP()), (_cont.entrySP() - _bottom_address) << LogBytesPerWord);
@@ -523,13 +516,17 @@ FreezeBase::FreezeBase(JavaThread* thread, ContinuationWrapper& cont, intptr_t* 
 
   assert(_cont.chunk_invariant(), "");
   assert(!Interpreter::contains(_cont.entryPC()), "");
-#if !defined(PPC64) || defined(ZERO)
-  static const int doYield_stub_frame_size = frame::metadata_words;
-#else
+#if defined(PPC64) && !defined(ZERO)
   static const int doYield_stub_frame_size = frame::native_abi_reg_args_size >> LogBytesPerWord;
+#elif defined(S390) && !defined(ZERO)
+  static const int doYield_stub_frame_size = frame::z_abi_160_base_size >> LogBytesPerWord;
+#else
+  static const int doYield_stub_frame_size = frame::metadata_words;
 #endif
   // With preemption doYield() might not have been resolved yet
-  assert(_preempt || SharedRuntime::cont_doYield_stub()->frame_size() == doYield_stub_frame_size, "");
+  assert(_preempt || SharedRuntime::cont_doYield_stub()->frame_size() == doYield_stub_frame_size,
+      "_preempt = %d, cont_doYield_stub()->frame_size() = %d, doYield_stub_frame_size = %d",
+      (_preempt ? 1 : 0), SharedRuntime::cont_doYield_stub()->frame_size(), doYield_stub_frame_size);
 
   if (preempt) {
     _last_frame = _thread->last_frame();
@@ -2079,6 +2076,7 @@ protected:
   void clear_chunk(stackChunkOop chunk);
   template<bool check_stub>
   int remove_top_compiled_frame_from_chunk(stackChunkOop chunk, int &argsize);
+  void check_top_for_deoptimization(stackChunkOop chunk);
   void copy_from_chunk(intptr_t* from, intptr_t* to, int size);
 
   void thaw_lockstack(stackChunkOop chunk);
@@ -2189,6 +2187,23 @@ public:
 inline void ThawBase::clear_chunk(stackChunkOop chunk) {
   chunk->set_sp(chunk->bottom());
   chunk->set_max_thawing_size(0);
+}
+
+void ThawBase::check_top_for_deoptimization(stackChunkOop chunk) {
+  StackChunkFrameStream<ChunkFrames::CompiledOnly> f(chunk);
+  if (f.is_stub()) {
+    f.next(SmallRegisterMap::instance_no_args(), true /* stop */);
+    assert(!f.is_done(), "");
+
+    f.get_cb();
+    assert(f.is_compiled(), "");
+    if (f.cb()->as_nmethod()->is_marked_for_deoptimization()) {
+      // The caller of the runtime stub when the continuation is preempted is not at a
+      // Java call instruction, and so cannot rely on nmethod patching for deopt.
+      log_develop_trace(continuations)("Deoptimizing runtime stub caller");
+      f.to_frame().deoptimize(nullptr); // the null thread simply avoids the assertion in deoptimize which we're not set up for
+    }
+  }
 }
 
 template<bool check_stub>
@@ -2307,6 +2322,9 @@ NOINLINE intptr_t* Thaw<ConfigT>::thaw_fast(stackChunkOop chunk) {
   if (LIKELY(!ForceSingleFrameThaw && (full_chunk_size < threshold))) {
     prefetch_chunk_pd(chunk->start_address(), full_chunk_size); // prefetch anticipating memcpy starting at highest address
 
+    if (check_stub) {
+      check_top_for_deoptimization(chunk);
+    }
     partial = false;
     argsize = chunk->argsize(); // must be called *before* clearing the chunk
     clear_chunk(chunk);
@@ -2597,7 +2615,13 @@ inline void ThawBase::patch(frame& f, const frame& caller, bool bottom) {
   } else if (_should_patch_caller_pc) {
     // Caller was deoptimized during thaw but we've overwritten the return address when copying f from the heap.
     // Also, on some platforms, if the caller is interpreted but the callee not we also need to patch.
-    assert(caller.is_deoptimized_frame() PPC64_ONLY(|| caller.is_interpreted_frame()), "");
+
+#if defined(PPC64) || defined(S390)
+    assert(caller.is_deoptimized_frame() || caller.is_interpreted_frame(), "");
+#else
+    assert(caller.is_deoptimized_frame(), "");
+#endif
+
     ContinuationHelper::Frame::patch_pc(caller, caller.raw_pc());
     _should_patch_caller_pc = false;
   }
